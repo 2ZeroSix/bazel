@@ -54,15 +54,18 @@ class RepoContentsCacheTest(test_base.TestBase):
     with open(self._test_bazelrc, 'at') as f:
       f.write('common --repo_contents_cache=%s\n' % self.repo_contents_cache)
 
-  def hasCacheEntry(self):
+  def countCacheEntries(self):
+    count = 0
     for l1 in os.listdir(self.repo_contents_cache):
       l1_path = os.path.join(self.repo_contents_cache, l1)
       if l1 != '_trash' and os.path.isdir(l1_path):
         for l2 in os.listdir(l1_path):
           if l2.endswith('.recorded_inputs'):
-            # we still have some cache entries!
-            return True
-    return False
+            count += 1
+    return count
+
+  def hasCacheEntry(self):
+    return self.countCacheEntries() > 0
 
   def sleepUntilCacheEmpty(self):
     for _ in range(10):
@@ -475,6 +478,53 @@ class RepoContentsCacheTest(test_base.TestBase):
     stderr = '\n'.join(stderr)
     self.assertIn('JUST FETCHED', stderr)
     self.assertNoUnexpectedWarning(stderr)
+
+  def testGc_maxSize(self):
+    self.ScratchFile(
+        'MODULE.bazel',
+        [
+            'repo = use_repo_rule("//:repo.bzl", "repo")',
+            'repo(name = "small", size = 10000)',
+            'repo(name = "big", size = 20000)',
+        ],
+    )
+    self.ScratchFile('BUILD.bazel')
+    self.ScratchFile(
+        'repo.bzl',
+        [
+            'def _repo_impl(rctx):',
+            '  rctx.file("BUILD", "filegroup(name=\'haha\')")',
+            '  rctx.file("data", "x" * rctx.attr.size)',
+            '  print("JUST FETCHED %d" % rctx.attr.size)',
+            '  return rctx.repo_metadata(reproducible=True)',
+            'repo = repository_rule(_repo_impl, attrs = {"size": attr.int()})',
+        ],
+    )
+    # Fetch the small repo first, so that it is the least recently used one.
+    _, _, stderr = self.RunBazel(['build', '@small//:haha'])
+    self.assertIn('JUST FETCHED 10000', '\n'.join(stderr))
+    time.sleep(0.1)
+
+    # Fetching the big repo pushes the cache over the size limit: GC evicts
+    # the small repo, but keeps the more recently used big one.
+    _, _, stderr = self.RunBazel([
+        'build',
+        '--repo_contents_cache_gc_max_size=25K',
+        '--repo_contents_cache_gc_idle_delay=1ms',
+        '@big//:haha',
+    ])
+    self.assertIn('JUST FETCHED 20000', '\n'.join(stderr))
+    for _ in range(10):
+      if self.countCacheEntries() == 1:
+        break
+      time.sleep(0.5)
+    self.assertEqual(self.countCacheEntries(), 1)
+
+    self.RunBazel(['clean', '--expunge'])
+    _, _, stderr = self.RunBazel(['build', '@small//:haha', '@big//:haha'])
+    stderr = '\n'.join(stderr)
+    self.assertIn('JUST FETCHED 10000', stderr)
+    self.assertNotIn('JUST FETCHED 20000', stderr)
 
   def testReverseDependencyDirection(self):
     # Set up two repos that retain their predeclared input hashes across two

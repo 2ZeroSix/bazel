@@ -27,15 +27,18 @@ import com.google.devtools.build.lib.util.FileSystemLock;
 import com.google.devtools.build.lib.util.FileSystemLock.LockMode;
 import com.google.devtools.build.lib.vfs.DigestHashFunction;
 import com.google.devtools.build.lib.vfs.Dirent;
+import com.google.devtools.build.lib.vfs.FileStatus;
 import com.google.devtools.build.lib.vfs.FileSystemUtils;
 import com.google.devtools.build.lib.vfs.Path;
 import com.google.devtools.build.lib.vfs.Symlinks;
 import java.io.IOException;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.List;
 import java.util.UUID;
 import javax.annotation.Nullable;
 
@@ -53,7 +56,9 @@ import javax.annotation.Nullable;
  *
  * <p>On a cache hit (that is, the predeclared inputs hash matches, and recorded inputs are
  * up-to-date), the recorded inputs file has its mtime updated. Cached repos whose recorded inputs
- * file is older than {@code --repo_contents_cache_gc_max_age} are garbage collected.
+ * file is older than {@code --repo_contents_cache_gc_max_age} are garbage collected. If {@code
+ * --repo_contents_cache_gc_max_size} is set, the least recently used cached repos are then garbage
+ * collected until the cache fits within that size.
  */
 public final class LocalRepoContentsCache {
   public static final String RECORDED_INPUTS_SUFFIX = ".recorded_inputs";
@@ -198,13 +203,16 @@ public final class LocalRepoContentsCache {
 
   /**
    * Creates a garbage collection {@link IdleTask} that deletes cached repos who are last accessed
-   * more than {@code maxAge} ago as well as duplicated repos, with an idle delay of {@code
-   * idleDelay}.
+   * more than {@code maxAge} ago as well as duplicated repos, and then deletes the least recently
+   * accessed cached repos until the cache is no larger than {@code maxSizeBytes}, with an idle
+   * delay of {@code idleDelay}.
    *
    * @param maxAge the maximum age of cached repos to keep in the cache. If zero, no repo will be
    *     garbage collected due to age.
+   * @param maxSizeBytes the maximum total size in bytes of cached repos to keep in the cache. If
+   *     zero, no repo will be garbage collected due to size.
    */
-  public IdleTask createGcIdleTask(Duration maxAge, Duration idleDelay) {
+  public IdleTask createGcIdleTask(Duration maxAge, long maxSizeBytes, Duration idleDelay) {
     Preconditions.checkState(path != null);
     return new IdleTask() {
       @Override
@@ -221,7 +229,7 @@ public final class LocalRepoContentsCache {
       public void run() throws InterruptedException, IdleTaskException {
         try {
           Preconditions.checkState(path != null);
-          runGc(maxAge);
+          runGc(maxAge, maxSizeBytes);
           // Empty the trash dir outside the lock. No one is reading from these files, so it should
           // be safe. At worst, multiple servers performing GC will try to delete the same files,
           // but whatever.
@@ -233,7 +241,10 @@ public final class LocalRepoContentsCache {
     };
   }
 
-  private void runGc(Duration maxAge) throws InterruptedException, IOException {
+  /** A cached repo with the mtime of its recorded inputs file at scan time. */
+  private record GcCandidate(CandidateRepo repo, long mtime) {}
+
+  private void runGc(Duration maxAge, long maxSizeBytes) throws InterruptedException, IOException {
     path.setLastModifiedTime(Path.NOW_SENTINEL_TIME);
     Instant cutoff =
         maxAge.isZero()
@@ -241,6 +252,7 @@ public final class LocalRepoContentsCache {
             : Instant.ofEpochMilli(path.getLastModifiedTime()).minus(maxAge);
     Path trashDir = ensureTrashDir();
     HashFunction sha256 = DigestHashFunction.SHA256.getHashFunction();
+    var survivors = new ArrayList<GcCandidate>();
 
     for (Dirent dirent : path.readdir(Symlinks.NOFOLLOW)) {
       if (dirent.getType() != Dirent.Type.DIRECTORY || dirent.getName().equals(TRASH_PATH)) {
@@ -254,13 +266,18 @@ public final class LocalRepoContentsCache {
       try (var lock = FileSystemLock.tryGet(path.getRelative(LOCK_PATH), LockMode.EXCLUSIVE)) {
         // Sort all recorded input files by descending mtime, so that deduplication keeps around the
         // most recent entry.
-        var recordedInputsFiles =
+        var candidates =
             path.getChild(dirent.getName()).getDirectoryEntries().stream()
                 .filter(file -> file.getBaseName().endsWith(RECORDED_INPUTS_SUFFIX))
-                .sorted(comparingLong(LocalRepoContentsCache::getLastModifiedTimeOrZero).reversed())
+                .map(
+                    file ->
+                        new GcCandidate(
+                            CandidateRepo.fromRecordedInputsFile(file),
+                            getLastModifiedTimeOrZero(file)))
+                .sorted(comparingLong(GcCandidate::mtime).reversed())
                 .collect(toImmutableList());
         var seen = new HashSet<HashCode>();
-        for (Path recordedInputsFile : recordedInputsFiles) {
+        for (GcCandidate candidate : candidates) {
           if (Thread.interrupted()) {
             throw new InterruptedException();
           }
@@ -269,16 +286,85 @@ public final class LocalRepoContentsCache {
           // created
           // when multiple Bazel servers fetch the same repo at the same time. The servers that have
           // their referenced entry deleted will roll over to the next entry on the next build.
-          if (Instant.ofEpochMilli(recordedInputsFile.getLastModifiedTime()).isBefore(cutoff)
-              || !seen.add(sha256.hashBytes(FileSystemUtils.readContent(recordedInputsFile)))) {
-            recordedInputsFile.delete();
-            var repoDir = CandidateRepo.fromRecordedInputsFile(recordedInputsFile).contentsDir;
-            // Use a UUID to avoid clashes.
-            repoDir.renameTo(trashDir.getChild(UUID.randomUUID().toString()));
+          if (Instant.ofEpochMilli(candidate.mtime()).isBefore(cutoff)
+              || !seen.add(
+                  sha256.hashBytes(
+                      FileSystemUtils.readContent(candidate.repo().recordedInputsFile())))) {
+            moveToTrash(candidate.repo(), trashDir);
+          } else {
+            survivors.add(candidate);
           }
         }
       }
     }
+
+    if (maxSizeBytes > 0) {
+      evictLeastRecentlyUsed(survivors, maxSizeBytes, trashDir);
+    }
+  }
+
+  /**
+   * Deletes the least recently used cached repos among {@code candidates} until their total size is
+   * at most {@code maxSizeBytes}.
+   *
+   * <p>Sizes are computed without holding the lock, since cached repo contents are never modified
+   * in place. The lock is only held while deleting a single entry, after verifying that it hasn't
+   * been used (touched) by another server since it was scanned.
+   */
+  private void evictLeastRecentlyUsed(
+      List<GcCandidate> candidates, long maxSizeBytes, Path trashDir)
+      throws InterruptedException, IOException {
+    candidates.sort(comparingLong(GcCandidate::mtime));
+    long[] sizes = new long[candidates.size()];
+    long totalSizeBytes = 0;
+    for (int i = 0; i < candidates.size(); i++) {
+      try {
+        sizes[i] = getTreeSize(candidates.get(i).repo().contentsDir());
+      } catch (IOException e) {
+        // Deleted concurrently by another server.
+      }
+      totalSizeBytes += sizes[i];
+    }
+
+    for (int i = 0; i < candidates.size() && totalSizeBytes > maxSizeBytes; i++) {
+      if (Thread.interrupted()) {
+        throw new InterruptedException();
+      }
+      GcCandidate candidate = candidates.get(i);
+      try (var lock = FileSystemLock.tryGet(path.getRelative(LOCK_PATH), LockMode.EXCLUSIVE)) {
+        FileStatus status = candidate.repo().recordedInputsFile().statIfFound(Symlinks.NOFOLLOW);
+        if (status == null || status.getLastModifiedTime() != candidate.mtime()) {
+          // Deleted or used by another server since the scan.
+          continue;
+        }
+        moveToTrash(candidate.repo(), trashDir);
+      }
+      totalSizeBytes -= sizes[i];
+    }
+  }
+
+  /** Deletes a cached repo by removing its recorded inputs file and trashing its contents. */
+  private static void moveToTrash(CandidateRepo repo, Path trashDir) throws IOException {
+    repo.recordedInputsFile().delete();
+    // Use a UUID to avoid clashes.
+    repo.contentsDir().renameTo(trashDir.getChild(UUID.randomUUID().toString()));
+  }
+
+  /** Returns the total size in bytes of the files below {@code dir}, not following symlinks. */
+  private static long getTreeSize(Path dir) throws IOException, InterruptedException {
+    long size = 0;
+    for (Dirent dirent : dir.readdir(Symlinks.NOFOLLOW)) {
+      if (Thread.interrupted()) {
+        throw new InterruptedException();
+      }
+      Path child = dir.getChild(dirent.getName());
+      switch (dirent.getType()) {
+        case FILE -> size += child.getFileSize(Symlinks.NOFOLLOW);
+        case DIRECTORY -> size += getTreeSize(child);
+        default -> {}
+      }
+    }
+    return size;
   }
 
   private static long getLastModifiedTimeOrZero(Path path) {

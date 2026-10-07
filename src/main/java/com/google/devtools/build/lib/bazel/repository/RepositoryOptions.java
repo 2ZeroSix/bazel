@@ -21,6 +21,7 @@ import com.google.devtools.build.lib.vfs.PathFragment;
 import com.google.devtools.common.options.BoolOrEnumConverter;
 import com.google.devtools.common.options.Converter;
 import com.google.devtools.common.options.Converters;
+import com.google.devtools.common.options.Converters.ByteSizeConverter;
 import com.google.devtools.common.options.Converters.DurationConverter;
 import com.google.devtools.common.options.EnumConverter;
 import com.google.devtools.common.options.Option;
@@ -85,6 +86,22 @@ public abstract class RepositoryOptions extends OptionsBase {
           it's garbage collected. If set to zero, only duplicate entries will be garbage collected.
           """)
   public abstract Duration getRepoContentsCacheGcMaxAge();
+
+  @Option(
+      name = "repo_contents_cache_gc_max_size",
+      defaultValue = "0",
+      documentationCategory = OptionDocumentationCategory.BAZEL_CLIENT_OPTIONS,
+      effectTags = {OptionEffectTag.BAZEL_INTERNAL_CONFIGURATION},
+      converter = ByteSizeConverter.class,
+      help =
+          """
+          If set to a positive value, the repo contents cache will be garbage collected to stay
+          under this size, deleting the least recently used entries first. If set in conjunction
+          with --repo_contents_cache_gc_max_age, both criteria are applied. Garbage collection
+          happens once the server has become idle, as determined by the
+          --repo_contents_cache_gc_idle_delay flag.
+          """)
+  public abstract long getRepoContentsCacheGcMaxSize();
 
   @Option(
       name = "repo_contents_cache_gc_idle_delay",

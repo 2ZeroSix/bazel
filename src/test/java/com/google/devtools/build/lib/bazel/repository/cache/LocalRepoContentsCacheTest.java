@@ -23,6 +23,7 @@ import com.google.devtools.build.lib.vfs.DigestHashFunction;
 import com.google.devtools.build.lib.vfs.Dirent;
 import com.google.devtools.build.lib.vfs.FileSystemUtils;
 import com.google.devtools.build.lib.vfs.JavaIoFileSystem;
+import com.google.devtools.build.lib.vfs.Path;
 import com.google.devtools.build.lib.vfs.PathFragment;
 import java.io.IOException;
 import java.io.UncheckedIOException;
@@ -78,7 +79,7 @@ public final class LocalRepoContentsCacheTest {
     var cache = new LocalRepoContentsCache();
     cache.setPath(cachePath);
 
-    cache.createGcIdleTask(Duration.ofMillis(1), Duration.ZERO).run();
+    cache.createGcIdleTask(Duration.ofMillis(1), 0, Duration.ZERO).run();
 
     assertThat(sharedLocksAcquired.get()).isEqualTo(2);
     for (String hash : new String[] {"first", "second"}) {
@@ -86,5 +87,124 @@ public final class LocalRepoContentsCacheTest {
     }
     assertThat(cachePath.getRelative(LocalRepoContentsCache.TRASH_PATH).getDirectoryEntries())
         .isEmpty();
+  }
+
+  @Test
+  public void gc_maxSize_evictsLeastRecentlyUsedEntriesFirst() throws Exception {
+    var cachePath = createCachePath();
+    long now = System.currentTimeMillis();
+    var oldest = createEntry(cachePath, "hash1", "a", 100, now - 3000);
+    var middle = createEntry(cachePath, "hash2", "b", 100, now - 2000);
+    var newest = createEntry(cachePath, "hash1", "c", 100, now - 1000);
+    var cache = new LocalRepoContentsCache();
+    cache.setPath(cachePath);
+
+    cache.createGcIdleTask(Duration.ZERO, 200, Duration.ZERO).run();
+
+    assertThat(oldest.exists()).isFalse();
+    assertThat(cachePath.getRelative("hash1/a.recorded_inputs").exists()).isFalse();
+    assertThat(middle.exists()).isTrue();
+    assertThat(newest.exists()).isTrue();
+    assertThat(cachePath.getRelative(LocalRepoContentsCache.TRASH_PATH).getDirectoryEntries())
+        .isEmpty();
+  }
+
+  @Test
+  public void gc_maxSizeZero_doesNotEvictBySize() throws Exception {
+    var cachePath = createCachePath();
+    long now = System.currentTimeMillis();
+    var first = createEntry(cachePath, "hash1", "a", 100, now - 2000);
+    var second = createEntry(cachePath, "hash2", "b", 100, now - 1000);
+    var cache = new LocalRepoContentsCache();
+    cache.setPath(cachePath);
+
+    cache.createGcIdleTask(Duration.ZERO, 0, Duration.ZERO).run();
+
+    assertThat(first.exists()).isTrue();
+    assertThat(second.exists()).isTrue();
+  }
+
+  @Test
+  public void gc_maxSizeAndMaxAge_appliesBothCriteria() throws Exception {
+    var cachePath = createCachePath();
+    long now = System.currentTimeMillis();
+    var expired = createEntry(cachePath, "hash1", "a", 1, now - Duration.ofDays(2).toMillis());
+    var older = createEntry(cachePath, "hash2", "b", 100, now - 2000);
+    var newer = createEntry(cachePath, "hash3", "c", 100, now - 1000);
+    var cache = new LocalRepoContentsCache();
+    cache.setPath(cachePath);
+
+    cache.createGcIdleTask(Duration.ofDays(1), 150, Duration.ZERO).run();
+
+    assertThat(expired.exists()).isFalse();
+    assertThat(older.exists()).isFalse();
+    assertThat(newer.exists()).isTrue();
+  }
+
+  @Test
+  public void gc_maxSize_doesNotCountSymlinkTargets() throws Exception {
+    var cachePath = createCachePath();
+    long now = System.currentTimeMillis();
+    var outside = cachePath.getParentDirectory().getRelative(cachePath.getBaseName() + "_large");
+    FileSystemUtils.writeContent(outside, new byte[1000]);
+    var first = createEntry(cachePath, "hash1", "a", 10, now - 2000);
+    first.getRelative("link").createSymbolicLink(outside);
+    var second = createEntry(cachePath, "hash2", "b", 10, now - 1000);
+    var cache = new LocalRepoContentsCache();
+    cache.setPath(cachePath);
+
+    cache.createGcIdleTask(Duration.ZERO, 100, Duration.ZERO).run();
+
+    assertThat(first.exists()).isTrue();
+    assertThat(second.exists()).isTrue();
+  }
+
+  @Test
+  public void gc_maxSize_keepsEntriesUsedDuringGc() throws Exception {
+    var cachePath = createCachePath();
+    long now = System.currentTimeMillis();
+    var oldest = createEntry(cachePath, "hash1", "a", 100, now - 3000);
+    var middle = createEntry(cachePath, "hash2", "b", 100, now - 2000);
+    var newest = createEntry(cachePath, "hash3", "c", 100, now - 1000);
+    // Simulate another server using the oldest entry while GC computes its size.
+    var fs =
+        new JavaIoFileSystem(DigestHashFunction.SHA256) {
+          @Override
+          public Collection<Dirent> readdir(PathFragment path, boolean followSymlinks)
+              throws IOException {
+            if (path.equals(oldest.asFragment())) {
+              getPath(path.replaceName("a.recorded_inputs")).setLastModifiedTime(now);
+            }
+            return super.readdir(path, followSymlinks);
+          }
+        };
+    var cache = new LocalRepoContentsCache();
+    cache.setPath(fs.getPath(cachePath.asFragment()));
+
+    cache.createGcIdleTask(Duration.ZERO, 200, Duration.ZERO).run();
+
+    assertThat(oldest.exists()).isTrue();
+    assertThat(middle.exists()).isFalse();
+    assertThat(newest.exists()).isTrue();
+  }
+
+  private static Path createCachePath() throws IOException {
+    var fs = new JavaIoFileSystem(DigestHashFunction.SHA256);
+    return fs.getPath(TestUtils.createUniqueTmpDir(null).asFragment());
+  }
+
+  /**
+   * Creates a cached repo with a {@code size}-byte file as its contents and a recorded inputs file
+   * last modified at {@code mtime}, returning its contents directory.
+   */
+  private static Path createEntry(Path cachePath, String hash, String name, int size, long mtime)
+      throws IOException {
+    var contentsDir = cachePath.getRelative(hash).getRelative(name);
+    contentsDir.createDirectoryAndParents();
+    FileSystemUtils.writeContent(contentsDir.getRelative("file"), new byte[size]);
+    var recordedInputs = cachePath.getRelative(hash).getRelative(name + ".recorded_inputs");
+    FileSystemUtils.writeContentAsLatin1(recordedInputs, name);
+    recordedInputs.setLastModifiedTime(mtime);
+    return contentsDir;
   }
 }
